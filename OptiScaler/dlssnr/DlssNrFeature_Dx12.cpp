@@ -213,13 +213,12 @@ struct NrState
     void* pendingColorUntyped = nullptr;
     bool pendingColorSwap = false;
 
-    // Dimensions of the guides as the upscaler handed them over, kept for the present path, which runs
-    // long after that call has returned.
+    // Dimensions of the guides as the upscaler handed them over, recorded each pass alongside the mv
+    // scale below -- both are logged once and otherwise only read within the same call.
     unsigned int guideWidth = 0;
     unsigned int guideHeight = 0;
 
-    // How the game encodes its guides, as the game itself reports it. Captured with the guides, since
-    // the finished-frame path runs long after the upscaler's call has returned.
+    // How the game encodes its guides, as the game itself reports it, recorded the same way.
     bool guideDepthInverted = false;
     float guideMvScaleX = 1.0f;
     float guideMvScaleY = 1.0f;
@@ -1320,7 +1319,7 @@ NrPassResult RunNeuralRenderingPass(ID3D12GraphicsCommandList* cmdList, NVSDK_NG
 }
 
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue)
+                          ID3D12CommandQueue* timingQueue, bool isRayReconstruction)
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
@@ -1333,8 +1332,10 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
 
     // The two injection points are mutually exclusive, and the check lives here -- inside each entry
     // point -- rather than at the call sites, so a call site that forgets to gate itself still cannot
-    // make both run in the same frame.
-    if (cfg.DlssNrInjectBeforeUpscale.value_or_default())
+    // make both run in the same frame. Ray Reconstruction is the exception: EvaluateBeforeUpscale
+    // always refuses it, so this must always run for it regardless of the toggle, or the model would
+    // never see a Ray Reconstruction frame at all while before-upscale mode is selected.
+    if (!isRayReconstruction && cfg.DlssNrInjectBeforeUpscale.value_or_default())
     {
         ReportSkipOnce("before-upscale mode is selected");
         return;
@@ -1367,7 +1368,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
 }
 
 bool EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                           ID3D12CommandQueue* timingQueue)
+                           ID3D12CommandQueue* timingQueue, bool isRayReconstruction)
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
@@ -1375,6 +1376,17 @@ bool EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramet
     if (!cfg.DlssNrEnabled.value_or_default())
     {
         ReportSkipOnce("it is switched off");
+        return false;
+    }
+
+    // Ray Reconstruction denoises and upscales in one opaque evaluate: there is no NGX-exposed buffer
+    // that is both denoised and pre-upscale, and its Color parameter is the noisy pre-denoise radiance
+    // instead. DlssNr's detail synthesis has no temporal accumulator to denoise that with, so running
+    // here would sharpen noise rather than add detail -- always take the after-upscale path instead,
+    // regardless of the toggle.
+    if (isRayReconstruction)
+    {
+        ReportSkipOnce("before-upscale mode does not apply to Ray Reconstruction");
         return false;
     }
 

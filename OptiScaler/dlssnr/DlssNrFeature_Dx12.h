@@ -28,20 +28,30 @@ namespace DlssNr
 // timingQueue is the queue this command list will be executed on, when the caller knows it.
 // State::currentCommandQueue only exists once a D3D12 swapchain has been created, which a Vulkan
 // game never does -- so without this the pass runs and never reports what it cost.
+// isRayReconstruction forces the after-upscale timing regardless of DlssNrInjectBeforeUpscale: Ray
+// Reconstruction denoises and upscales in one opaque evaluate, so its Color parameter is pre-denoise
+// noise rather than a usable pre-upscale image, and DlssNr has no denoising capability of its own to
+// work with that. See EvaluateBeforeUpscale.
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue = nullptr);
+                          ID3D12CommandQueue* timingQueue = nullptr, bool isRayReconstruction = false);
 
 // The other insertion point: runs the model over the game's own Color input, at render resolution,
 // immediately before the real upscaler's Evaluate is called -- so the upscaler works from the
 // enhanced frame instead of enhancing its own output afterward. Mutually exclusive with
 // EvaluateAfterUpscale; a no-op unless DlssNrInjectBeforeUpscale is set.
 //
+// Always refuses when isRayReconstruction: Ray Reconstruction's Color is the noisy, pre-denoise
+// radiance -- there is no NGX-exposed buffer that is both denoised and pre-upscale -- and DlssNr's
+// detail synthesis has no temporal accumulator to denoise it with, so running here would sharpen noise
+// rather than add detail. Ray Reconstruction always takes the after-upscale path instead.
+//
 // Returns true when it swapped NVSDK_NGX_Parameter_Color to point at its own surface, in which case
 // the caller must call FinishBeforeUpscale after the real Evaluate returns, whatever the result, to
 // restore the parameter block and hand the surface back for the next frame. Returns false when it did
-// nothing (disabled, wrong mode selected, missing inputs, or a build frame) -- nothing to finish.
+// nothing (disabled, wrong mode selected, Ray Reconstruction, missing inputs, or a build frame) --
+// nothing to finish.
 bool EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                           ID3D12CommandQueue* timingQueue = nullptr);
+                           ID3D12CommandQueue* timingQueue = nullptr, bool isRayReconstruction = false);
 
 // Pairs with a true return from EvaluateBeforeUpscale. Restores the Color parameter slots to what
 // they held before the swap and returns the working surface to its resting state.
