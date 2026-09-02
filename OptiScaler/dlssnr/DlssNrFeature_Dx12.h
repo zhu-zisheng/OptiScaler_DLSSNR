@@ -31,6 +31,22 @@ namespace DlssNr
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
 
+// The other insertion point: runs the model over the game's own Color input, at render resolution,
+// immediately before the real upscaler's Evaluate is called -- so the upscaler works from the
+// enhanced frame instead of enhancing its own output afterward. Mutually exclusive with
+// EvaluateAfterUpscale; a no-op unless DlssNrInjectBeforeUpscale is set.
+//
+// Returns true when it swapped NVSDK_NGX_Parameter_Color to point at its own surface, in which case
+// the caller must call FinishBeforeUpscale after the real Evaluate returns, whatever the result, to
+// restore the parameter block and hand the surface back for the next frame. Returns false when it did
+// nothing (disabled, wrong mode selected, missing inputs, or a build frame) -- nothing to finish.
+bool EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                           ID3D12CommandQueue* timingQueue = nullptr);
+
+// Pairs with a true return from EvaluateBeforeUpscale. Restores the Color parameter slots to what
+// they held before the swap and returns the working surface to its resting state.
+void FinishBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params);
+
 
 // Frame generation titles tag their UI layer through Streamline; a copy of it makes the HUD mask
 // exact at the finished frame. Called at tag time.

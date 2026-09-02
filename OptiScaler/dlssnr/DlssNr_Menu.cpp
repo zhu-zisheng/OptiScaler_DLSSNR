@@ -47,6 +47,18 @@ void RenderMenu(Config* config, float menuResScale)
                        "\n  nvngx.dll_dlssnr.dll   the forwarder (~13 KB) -- ships in this package"
                        "\nUndocumented and driven directly, so none of this is officially supported.");
 
+        bool injectBefore = config->DlssNrInjectBeforeUpscale.value_or_default();
+        if (ImGui::Checkbox("Run before the upscaler", &injectBefore))
+            config->DlssNrInjectBeforeUpscale = injectBefore;
+
+        HelpMarker("Enhances the game's low-resolution frame before the upscaler sees it, instead of"
+                       "\nthe upscaler's finished, display-resolution output afterward."
+                       "\n\nRuns at render resolution, so the depth and motion vector guides line up"
+                       "\nexactly with the image being enhanced -- no subrect mismatch to account for."
+                       "\nThe upscaler then works from the enhanced frame."
+                       "\n\nExperimental, and mutually exclusive with the default after-upscale pass:"
+                       "\nonly one runs per frame, whichever this says. Off by default.");
+
         // The toggle can be bound to a key, and nobody would think to look for it under Keybinds
         // unless told. Dimmed, because it is a note rather than a setting.
         ImGui::TextDisabled("Can be toggled with a key -- bind it under Keybinds, \"Neural Rendering\".");

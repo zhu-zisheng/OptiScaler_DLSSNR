@@ -200,6 +200,19 @@ struct NrState
     unsigned int height = 0;
     bool reset = true;
 
+    // Before-mode only: the render-resolution enhanced Color surface handed to the real upscaler in
+    // place of the game's own Color while it evaluates. Rests in UNORDERED_ACCESS between frames, like
+    // every other scratch buffer here; FinishBeforeUpscale is what puts it back there after the real
+    // upscaler has read it as an SRV.
+    ID3D12Resource* beforeColor = nullptr;
+
+    // What NVSDK_NGX_Parameter_Color held -- both its typed and untyped slots, since real NVNGX and
+    // OptiScaler's own D3D11/Vulkan bridges read through different ones -- before EvaluateBeforeUpscale
+    // swapped beforeColor in. Restored by FinishBeforeUpscale. Only meaningful while pendingColorSwap.
+    ID3D12Resource* pendingColorTyped = nullptr;
+    void* pendingColorUntyped = nullptr;
+    bool pendingColorSwap = false;
+
     // Dimensions of the guides as the upscaler handed them over, kept for the present path, which runs
     // long after that call has returned.
     unsigned int guideWidth = 0;
@@ -763,48 +776,41 @@ void ReportSkipOnce(const char* reason)
         LOG_INFO("DLSS-NR did not run: {}", reason);
 }
 
-void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue)
+// What a run of the pass accomplished, so the two entry points below can decide what to do next --
+// After-mode has nothing left to do either way, but Before-mode only swaps the Color parameter when
+// this comes back Resolved: a build frame or a failure has left resolveDest with nothing usable in it.
+enum class NrPassResult
 {
-    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    NotRun,   // disabled, wrong mode, missing input, or an unrelated setup failure
+    Building, // the model feature was (re)built this frame; nothing evaluated yet
+    Failed,   // the model or the resolve ran and failed
+    Resolved  // resolveDest now holds the composited result
+};
+
+// Everything genuinely agnostic to which stage of the pipeline is calling: builds/rebuilds the model
+// feature, prepares the guides, runs the model, and dispatches the encode and resolve passes. The two
+// public entry points below differ only in what encodeSource/resolveDest are bound to and what state
+// each is found in and left in -- see their call sites for the reasoning.
+//
+// Caller holds g_nrMutex and has already checked DlssNrEnabled, the injection-point mode, and that
+// cmdList/params/encodeSource/depth/motion are non-null.
+NrPassResult RunNeuralRenderingPass(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                                    ID3D12CommandQueue* timingQueue, ID3D12Resource* encodeSource,
+                                    D3D12_RESOURCE_STATES encodeSourceRestState, ID3D12Resource* resolveDest,
+                                    D3D12_RESOURCE_STATES resolveDestRestState, ID3D12Resource* depth,
+                                    ID3D12Resource* motion)
+{
     const Config& cfg = *Config::Instance();
-
-    if (!cfg.DlssNrEnabled.value_or_default())
-    {
-        ReportSkipOnce("it is switched off");
-        return;
-    }
-
-    if (g_nr.failed || cmdList == nullptr || params == nullptr)
-    {
-        ReportSkipOnce(g_nr.failed ? "it already failed this session"
-                                   : "no command list or no parameter block");
-        return;
-    }
-
-    ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
-    ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
-    ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
-
-    // Without all three there is nothing to run on. This is not a failure -- some evaluates legitimately
-    // carry none of it -- so it stays quiet and tries again next frame.
-    if (target == nullptr || depth == nullptr || motion == nullptr)
-    {
-        ReportSkipOnce(target == nullptr    ? "the parameters carried no output texture"
-                       : depth == nullptr   ? "the parameters carried no depth"
-                                            : "the parameters carried no motion vectors");
-        return;
-    }
 
     ID3D12Device* device = nullptr;
 
-    if (FAILED(target->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    if (FAILED(encodeSource->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
     {
-        ReportSkipOnce("the output texture belongs to no D3D12 device");
-        return;
+        ReportSkipOnce("the image belongs to no D3D12 device");
+        return NrPassResult::NotRun;
     }
 
-    const D3D12_RESOURCE_DESC desc = target->GetDesc();
+    const D3D12_RESOURCE_DESC desc = encodeSource->GetDesc();
     const auto width = (unsigned int) desc.Width;
     const auto height = desc.Height;
 
@@ -880,7 +886,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         g_nr.failed = true;
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
-        return;
+        return NrPassResult::NotRun;
     }
 
     // What the model works at. The frame and its edit stay full resolution; only the model's input and
@@ -945,7 +951,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
             g_nr.reason = "nvngx_dlssnr.dll was not found beside OptiScaler or the game";
             LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
             device->Release();
-            return;
+            return NrPassResult::NotRun;
         }
 
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
@@ -973,7 +979,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
             LOG_ERROR("DLSS-NR create failed: init 0x{:X} ({}), create 0x{:X} ({})", initResult,
                       NgxResultName(initResult), createResult, NgxResultName(createResult));
             device->Release();
-            return;
+            return NrPassResult::NotRun;
         }
 
         g_nr.width = width;
@@ -987,13 +993,13 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
         // first; the first evaluate happens next frame. One frame without the model is invisible.
         device->Release();
-        return;
+        return NrPassResult::Building;
     }
 
     if (g_nr.feature == nullptr)
     {
         device->Release();
-        return;
+        return NrPassResult::NotRun;
     }
 
     // The upscaler has just written this, so it is a UAV. The model needs it readable.
@@ -1029,7 +1035,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         g_nr.reason = "the colour codec would not compile";
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
-        return;
+        return NrPassResult::NotRun;
     }
 
     // What the upscaler produces is linear HDR with an open-ended range; the model was trained on
@@ -1079,13 +1085,15 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     encodeParams.Width = width;
     encodeParams.Height = height;
 
-    Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    g_compose->Dispatch(cmdList, encodeParams, target, nullptr, nullptr, nullptr, nullptr,
+    // encodeSourceRestState is where this resource is found and where it is left: UNORDERED_ACCESS for
+    // the after-upscale pass (the upscaler just wrote it), NON_PIXEL_SHADER_RESOURCE for the
+    // before-upscale pass (the game's Color, already SRV-ready for the real Evaluate about to run) --
+    // in the latter case both barriers below are no-ops, since Barrier() skips a transition to itself.
+    Barrier(cmdList, encodeSource, encodeSourceRestState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_compose->Dispatch(cmdList, encodeParams, encodeSource, nullptr, nullptr, nullptr, nullptr,
                         g_nr.colorCopy, g_nr.hdrCopy);
 
-    Barrier(cmdList, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmdList, encodeSource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, encodeSourceRestState);
     // The transitions double as the wait for the encode's writes.
     Barrier(cmdList, g_nr.colorCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1118,7 +1126,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         g_nr.reason = "the game's depth or motion vectors could not be made readable";
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
-        return;
+        return NrPassResult::Failed;
     }
 
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the working size.
@@ -1148,8 +1156,11 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
                       proxyResult, NgxResultName(proxyResult));
         }
 
+        // Either way, the proxy path does not composite: it only ran the model into g_nr.output, the
+        // same as the forwarder path does before its own resolve step below. Nothing was written to
+        // resolveDest, so there is nothing for either entry point to do with this frame.
         device->Release();
-        return;
+        return NrPassResult::NotRun;
     }
 
     const int result = g_nr.evaluate(
@@ -1204,6 +1215,8 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
                  cfg.DlssNrStyle.value_or_default());
     }
 
+    NrPassResult passResult = NrPassResult::Failed;
+
     if (result == NVSDK_NGX_Result_Success)
     {
         // Resolve takes the difference between what the model returned and what it was shown, and adds
@@ -1224,26 +1237,35 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         resolveParams.CompareZoom = std::max(1.0f, cfg.DlssNrCompareZoom.value_or_default());
         resolveParams.CompareSwap = cfg.DlssNrCompareSwap.value_or_default() ? 1u : 0u;
 
+        // resolveDest is found in UNORDERED_ACCESS here -- After-mode because encodeSource (the same
+        // resource) was just restored to encodeSourceRestState=UNORDERED_ACCESS above, Before-mode
+        // because that is the resting state FinishBeforeUpscale leaves its scratch surface in between
+        // frames. Left in resolveDestRestState once written: UNORDERED_ACCESS for After (nothing reads
+        // it again before next frame's encode), NON_PIXEL_SHADER_RESOURCE for Before (the real
+        // upscaler's Evaluate is about to read it as Color).
         Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         g_compose->Dispatch(cmdList, resolveParams, modelInput, g_nr.output, g_nr.hdrCopy, motionIn,
-                            nullptr, target, nullptr);
+                            nullptr, resolveDest, nullptr);
         Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Barrier(cmdList, resolveDest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, resolveDestRestState);
 
         // On-demand capture works in this path too: the staging copy still holds the frame as the
-        // upscaler produced it, and the edited frame is the output itself. The write happens a few
+        // upscaler produced it, and the edited frame is the resolved result. The write happens a few
         // frames later, once the GPU is certainly past these copies -- this path has no fence of its
         // own.
         if (g_capture.isActive())
         {
             g_capture.record(cmdList, device, g_nr.colorCopy,
-                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
-                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, resolveDest,
+                             resolveDestRestState);
 
             if (g_capture.readyToWrite() && g_captureWriteAtFrame == 0)
                 g_captureWriteAtFrame = g_frames + 8;
         }
+
+        passResult = NrPassResult::Resolved;
     }
     else
     {
@@ -1251,6 +1273,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         g_nr.reason = "the model refused to run";
         LOG_ERROR("DLSS-NR evaluate returned 0x{:X} ({}), disabling for this session", (uint32_t) result,
                   NgxResultName((unsigned int) result));
+        passResult = NrPassResult::Failed;
     }
 
     Barrier(cmdList, g_nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -1293,6 +1316,176 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     device->Release();
+    return passResult;
+}
+
+void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                          ID3D12CommandQueue* timingQueue)
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    const Config& cfg = *Config::Instance();
+
+    if (!cfg.DlssNrEnabled.value_or_default())
+    {
+        ReportSkipOnce("it is switched off");
+        return;
+    }
+
+    // The two injection points are mutually exclusive, and the check lives here -- inside each entry
+    // point -- rather than at the call sites, so a call site that forgets to gate itself still cannot
+    // make both run in the same frame.
+    if (cfg.DlssNrInjectBeforeUpscale.value_or_default())
+    {
+        ReportSkipOnce("before-upscale mode is selected");
+        return;
+    }
+
+    if (g_nr.failed || cmdList == nullptr || params == nullptr)
+    {
+        ReportSkipOnce(g_nr.failed ? "it already failed this session"
+                                   : "no command list or no parameter block");
+        return;
+    }
+
+    ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
+    ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
+    ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
+
+    // Without all three there is nothing to run on. This is not a failure -- some evaluates legitimately
+    // carry none of it -- so it stays quiet and tries again next frame.
+    if (target == nullptr || depth == nullptr || motion == nullptr)
+    {
+        ReportSkipOnce(target == nullptr    ? "the parameters carried no output texture"
+                       : depth == nullptr   ? "the parameters carried no depth"
+                                            : "the parameters carried no motion vectors");
+        return;
+    }
+
+    // In place: the same resource is both what the model is shown and where its edit lands.
+    RunNeuralRenderingPass(cmdList, params, timingQueue, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, depth, motion);
+}
+
+bool EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                           ID3D12CommandQueue* timingQueue)
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    const Config& cfg = *Config::Instance();
+
+    if (!cfg.DlssNrEnabled.value_or_default())
+    {
+        ReportSkipOnce("it is switched off");
+        return false;
+    }
+
+    if (!cfg.DlssNrInjectBeforeUpscale.value_or_default())
+    {
+        ReportSkipOnce("after-upscale mode is selected");
+        return false;
+    }
+
+    if (g_nr.failed || cmdList == nullptr || params == nullptr)
+    {
+        ReportSkipOnce(g_nr.failed ? "it already failed this session"
+                                   : "no command list or no parameter block");
+        return false;
+    }
+
+    ID3D12Resource* color = GetResource(params, NVSDK_NGX_Parameter_Color, "DLSSD.Color");
+    ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
+    ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
+
+    if (color == nullptr || depth == nullptr || motion == nullptr)
+    {
+        ReportSkipOnce(color == nullptr     ? "the parameters carried no colour texture"
+                       : depth == nullptr   ? "the parameters carried no depth"
+                                            : "the parameters carried no motion vectors");
+        return false;
+    }
+
+    ID3D12Device* device = nullptr;
+
+    if (FAILED(color->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    {
+        ReportSkipOnce("the colour texture belongs to no D3D12 device");
+        return false;
+    }
+
+    // beforeColor's own lifecycle: it tracks the game's Color resource directly rather than riding the
+    // after-mode scratch set's resolutionChanged machinery, since the two entry points can be toggled
+    // independently and this is the one surface only this path ever touches.
+    const D3D12_RESOURCE_DESC colorDesc = color->GetDesc();
+    const auto renderWidth = (unsigned int) colorDesc.Width;
+    const auto renderHeight = colorDesc.Height;
+
+    if (g_nr.beforeColor != nullptr)
+    {
+        const D3D12_RESOURCE_DESC haveDesc = g_nr.beforeColor->GetDesc();
+
+        if ((unsigned int) haveDesc.Width != renderWidth || haveDesc.Height != renderHeight ||
+            haveDesc.Format != colorDesc.Format)
+            ParkNrResource(g_nr.beforeColor);
+    }
+
+    if (g_nr.beforeColor == nullptr)
+        g_nr.beforeColor = CreateScratch(device, colorDesc.Format, renderWidth, renderHeight);
+
+    device->Release();
+
+    if (g_nr.beforeColor == nullptr)
+    {
+        ReportSkipOnce("the working surface could not be created");
+        return false;
+    }
+
+    // Read-only throughout: the game's Color arrives NON_PIXEL_SHADER_RESOURCE for the real upscaler
+    // that is about to run, and that is exactly the state the encode pass needs it in too -- so nothing
+    // here ever barriers it. The composited result lands in beforeColor instead, left
+    // NON_PIXEL_SHADER_RESOURCE for that same imminent Evaluate.
+    const NrPassResult passResult = RunNeuralRenderingPass(
+        cmdList, params, timingQueue, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        g_nr.beforeColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, depth, motion);
+
+    if (passResult != NrPassResult::Resolved)
+        return false;
+
+    // Capture what the slots held -- typed and untyped both, since native NVNGX reads the typed one and
+    // OptiScaler's own D3D11/Vulkan bridges read the untyped one, and this runs ahead of either -- then
+    // swap in the enhanced surface through both, so whichever the real Evaluate reads finds it.
+    g_nr.pendingColorTyped = nullptr;
+    g_nr.pendingColorUntyped = nullptr;
+    params->Get(NVSDK_NGX_Parameter_Color, &g_nr.pendingColorTyped);
+    params->Get(NVSDK_NGX_Parameter_Color, &g_nr.pendingColorUntyped);
+
+    params->Set(NVSDK_NGX_Parameter_Color, g_nr.beforeColor);
+    params->Set(NVSDK_NGX_Parameter_Color, (void*) g_nr.beforeColor);
+
+    g_nr.pendingColorSwap = true;
+    return true;
+}
+
+void FinishBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params)
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    if (!g_nr.pendingColorSwap)
+        return;
+
+    g_nr.pendingColorSwap = false;
+
+    if (params != nullptr)
+    {
+        params->Set(NVSDK_NGX_Parameter_Color, g_nr.pendingColorTyped);
+        params->Set(NVSDK_NGX_Parameter_Color, g_nr.pendingColorUntyped);
+    }
+
+    g_nr.pendingColorTyped = nullptr;
+    g_nr.pendingColorUntyped = nullptr;
+
+    // Back to the resting state every other scratch buffer here shares, ready for next frame's resolve.
+    if (cmdList != nullptr && g_nr.beforeColor != nullptr)
+        Barrier(cmdList, g_nr.beforeColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
 bool IsRunning() { return g_nr.feature != nullptr && !g_nr.failed; }
@@ -1352,6 +1545,16 @@ void Shutdown()
         g_nr.colorSmall->Release();
         g_nr.colorSmall = nullptr;
     }
+
+    if (g_nr.beforeColor != nullptr)
+    {
+        g_nr.beforeColor->Release();
+        g_nr.beforeColor = nullptr;
+    }
+
+    g_nr.pendingColorTyped = nullptr;
+    g_nr.pendingColorUntyped = nullptr;
+    g_nr.pendingColorSwap = false;
 
     if (g_nr.depthClone != nullptr)
     {

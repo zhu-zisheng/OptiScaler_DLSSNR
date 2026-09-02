@@ -402,12 +402,21 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
                               (void*) dx11Reactive.Dx12Resource);
 
         LOG_DEBUG("Dispatch!!");
-        dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
 
         // DLSS 5 Neural Rendering rides the bridge: at this moment the block carries the D3D12 copies
-        // of every input, the list is still recording, and the model's edit lands on the D3D12 output
-        // before it is copied back to the game's D3D11 texture. This one call is what makes the pass
-        // work in DirectX 11 games, whatever upscaler carried it here.
+        // of every input and the list is still recording. Before-mode enhances the D3D12 Color copy
+        // right here, ahead of the upscale it is about to feed; after-mode's edit lands on the D3D12
+        // output once the upscale is done, before it is copied back to the game's D3D11 texture. This
+        // one pair of calls is what makes either pass work in DirectX 11 games, whatever upscaler
+        // carried it here.
+        const bool nrBeforeRan = Config::Instance()->DlssNrEnabled.value_or_default() &&
+                                 DlssNr::EvaluateBeforeUpscale(cmdList, InParameters, Dx12CommandQueue);
+
+        dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+
+        if (nrBeforeRan)
+            DlssNr::FinishBeforeUpscale(cmdList, InParameters);
+
         static bool reportedNrOffer = false;
 
         if (!reportedNrOffer)
